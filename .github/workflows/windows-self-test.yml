@@ -76,8 +76,16 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $p = Start-Process -FilePath $env:INSTALLER -ArgumentList '/S' -Wait -PassThru
           if ($p.ExitCode -ne 0) { throw "The installer exited with $($p.ExitCode)" }
-          $exe = Join-Path $env:LOCALAPPDATA 'Programs\Planisphere\Planisphere.exe'
+          # The installer records its folder for the host (HKCU\Software\Planisphere InstallLocation).
+          $dir = (Get-ItemProperty -Path 'HKCU:\Software\Planisphere' -Name InstallLocation -ErrorAction SilentlyContinue).InstallLocation
+          if (-not $dir) {
+            Get-ChildItem (Join-Path $env:LOCALAPPDATA 'Programs') -Filter Planisphere.exe -Recurse -Depth 2 -ErrorAction SilentlyContinue |
+              ForEach-Object { Write-Output "Found $($_.FullName)" }
+            throw 'The installer recorded no InstallLocation under HKCU\Software\Planisphere.'
+          }
+          $exe = Join-Path $dir 'Planisphere.exe'
           if (-not (Test-Path $exe)) { throw "Planisphere.exe is not at $exe" }
+          "PLANISPHERE_DIR=$dir" >> $env:GITHUB_ENV
           # A silent install does not start the app; stop it if anything did, so the self-test runs alone.
           Get-Process -Name Planisphere -ErrorAction SilentlyContinue | Stop-Process -Force
           Write-Output "Installed $((Get-Item $exe).VersionInfo.FileVersion) at $exe"
@@ -130,8 +138,8 @@ jobs:
       - name: Uninstall silently
         if: always()
         run: |
-          $uninstaller = Join-Path $env:LOCALAPPDATA 'Programs\Planisphere\Uninstall Planisphere.exe'
-          if (Test-Path $uninstaller) {
+          $uninstaller = if ($env:PLANISPHERE_DIR) { Join-Path $env:PLANISPHERE_DIR 'Uninstall Planisphere.exe' } else { '' }
+          if ($uninstaller -and (Test-Path $uninstaller)) {
             $p = Start-Process -FilePath $uninstaller -ArgumentList '/S' -Wait -PassThru
             Write-Output "The uninstaller exited with $($p.ExitCode)"
           } else {
