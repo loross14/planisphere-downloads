@@ -1,0 +1,139 @@
+# Installs a published Planisphere for Windows release on a clean runner and runs `Planisphere.exe --self-test`
+# (coffer Windows/src/main/self-test/): the runtime install and hash check, the runtime's Python imports, DPAPI,
+# ConPTY, file watching, the knowledge graph store (with a junction it must refuse), Grapheine, memory, every
+# installed hook run as Claude Code and Codex would run it, llama-server and the Visual C++ runtime, renders of every
+# route, and Copy diagnostics. Uploads the report, renders and logs, posts the table to the job summary, fails on any
+# failed check, then uninstalls. Needs no secrets: the release is public.
+
+name: Windows self-test
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to test, for example windows-v0.10.2
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-self-test-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  self-test:
+    name: Self-test on ${{ matrix.runner }}
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.event.release.tag_name, 'windows-v')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            experimental: false
+          # The x64 build under Windows on Arm's emulation; reported, never blocking.
+          - runner: windows-11-arm
+            experimental: true
+    runs-on: ${{ matrix.runner }}
+    continue-on-error: ${{ matrix.experimental }}
+    timeout-minutes: 45
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Download the installer and check its SHA-256
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          if ($env:TAG -notmatch '^windows-v(\d+\.\d+\.\d+)$') { throw "Not a Windows release tag: $env:TAG" }
+          $version = $Matches[1]
+          $base = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$env:TAG"
+          $work = Join-Path $env:RUNNER_TEMP 'planisphere'
+          New-Item -ItemType Directory -Force -Path $work | Out-Null
+          $installer = Join-Path $work 'Planisphere-windows-x64-setup.exe'
+          $sums = Join-Path $work "Planisphere-$version-windows-x64-setup.exe.sha256"
+          foreach ($pair in @(@("$base/Planisphere-windows-x64-setup.exe", $installer), @("$base/Planisphere-$version-windows-x64-setup.exe.sha256", $sums))) {
+            for ($try = 1; ; $try++) {
+              try { Invoke-WebRequest -Uri $pair[0] -OutFile $pair[1]; break }
+              catch { if ($try -ge 5) { throw }; Write-Output "Retrying $($pair[0]) ($($_.Exception.Message))"; Start-Sleep -Seconds 15 }
+            }
+          }
+          $line = Get-Content $sums | Where-Object { $_ -match '^[0-9a-f]{64}  Planisphere-windows-x64-setup\.exe$' } | Select-Object -First 1
+          if (-not $line) { throw 'The .sha256 file does not name Planisphere-windows-x64-setup.exe' }
+          $expected = ($line -split '\s+')[0]
+          $actual = (Get-FileHash -Algorithm SHA256 -Path $installer).Hash.ToLowerInvariant()
+          if ($actual -ne $expected) { throw "SHA-256 mismatch: the release says $expected, the download is $actual" }
+          Write-Output "Planisphere-windows-x64-setup.exe $actual matches the release's .sha256"
+          "INSTALLER=$installer" >> $env:GITHUB_ENV
+
+      - name: Install silently
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $p = Start-Process -FilePath $env:INSTALLER -ArgumentList '/S' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "The installer exited with $($p.ExitCode)" }
+          $exe = Join-Path $env:LOCALAPPDATA 'Programs\Planisphere\Planisphere.exe'
+          if (-not (Test-Path $exe)) { throw "Planisphere.exe is not at $exe" }
+          # A silent install does not start the app; stop it if anything did, so the self-test runs alone.
+          Get-Process -Name Planisphere -ErrorAction SilentlyContinue | Stop-Process -Force
+          Write-Output "Installed $((Get-Item $exe).VersionInfo.FileVersion) at $exe"
+          "PLANISPHERE_EXE=$exe" >> $env:GITHUB_ENV
+
+      - name: Run Planisphere.exe --self-test
+        id: selftest
+        timeout-minutes: 30
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP 'self-test'
+          "SELF_TEST_OUT=$out" >> $env:GITHUB_ENV
+          # A GUI-subsystem program: Start-Process -Wait is what waits for it and returns its exit code.
+          $p = Start-Process -FilePath $env:PLANISPHERE_EXE -ArgumentList @('--self-test', "`"$out`"") -Wait -PassThru
+          Write-Output "Planisphere.exe --self-test exited with $($p.ExitCode)"
+          if (Test-Path (Join-Path $out 'self-test.log')) { Get-Content (Join-Path $out 'self-test.log') }
+          "code=$($p.ExitCode)" >> $env:GITHUB_OUTPUT
+
+      - name: Post the results to the job summary
+        if: always()
+        run: |
+          $summary = if ($env:SELF_TEST_OUT) { Join-Path $env:SELF_TEST_OUT 'self-test-summary.md' } else { '' }
+          if ($summary -and (Test-Path $summary)) {
+            "#### $env:TAG on ${{ matrix.runner }}" >> $env:GITHUB_STEP_SUMMARY
+            Get-Content -Raw $summary >> $env:GITHUB_STEP_SUMMARY
+          } else {
+            "### Planisphere self-test: no report ($env:TAG on ${{ matrix.runner }})" >> $env:GITHUB_STEP_SUMMARY
+          }
+
+      - name: Upload the report, renders and logs
+        if: always() && env.SELF_TEST_OUT != ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: self-test-${{ env.TAG }}-${{ matrix.runner }}
+          path: ${{ env.SELF_TEST_OUT }}
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Fail on any failed check
+        run: |
+          $report = Join-Path $env:SELF_TEST_OUT 'self-test.json'
+          if (-not (Test-Path $report)) { throw 'The self-test wrote no report.' }
+          $json = Get-Content -Raw $report | ConvertFrom-Json
+          $failed = @($json.checks | Where-Object { $_.status -eq 'fail' })
+          foreach ($check in $failed) { Write-Output "::error title=$($check.id)::$($check.reason)" }
+          if ($failed.Count -gt 0 -or -not $json.ok -or '${{ steps.selftest.outputs.code }}' -ne '0') {
+            throw "$($failed.Count) checks failed (exit code ${{ steps.selftest.outputs.code }})."
+          }
+          Write-Output "$($json.summary.pass) passed, $($json.summary.skip) skipped."
+
+      - name: Uninstall silently
+        if: always()
+        run: |
+          $uninstaller = Join-Path $env:LOCALAPPDATA 'Programs\Planisphere\Uninstall Planisphere.exe'
+          if (Test-Path $uninstaller) {
+            $p = Start-Process -FilePath $uninstaller -ArgumentList '/S' -Wait -PassThru
+            Write-Output "The uninstaller exited with $($p.ExitCode)"
+          } else {
+            Write-Output 'Nothing to uninstall.'
+          }
